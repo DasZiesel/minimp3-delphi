@@ -27,7 +27,7 @@ The demo program includes follow functionalities
 
 ## How-to build minimp3 library
 
-To build a installed version of GCC 4.8.1 are required, use the batch ***buildmp3.bat*** that compile minimp3lib.cpp file.
+To build a installed version of GCC 4.8.1 are required, use the batch ***buildlib.bat*** that compile minimp3lib.cpp file.
 
 ### Remarks
 
