@@ -7,8 +7,8 @@ uses
   Winapi.DirectSound, Winapi.DirectDraw,
   System.SysUtils, System.Variants, System.Classes, System.Math, System.RTLConsts,
   Vcl.Graphics, Vcl.Controls, Vcl.Forms, Vcl.Dialogs,
-  Vcl.StdCtrls,
-  minimp3lib, Vcl.ExtCtrls;
+  Vcl.StdCtrls, Vcl.ExtCtrls,
+  minimp3lib, openAl;
 
 const
   cBitsPerSample = 16; // Word;
@@ -78,6 +78,20 @@ type  // Riff Wave File Header
   TPlayerOnProgress = procedure(const Sender: TObject; const Pos, Total: Int64) of object;
   TPlayer = class
   private
+    FOnProgress: TPlayerOnProgress;
+  protected
+    procedure DoProgress(const Pos, Total: Int64);
+  public
+    constructor Create(); virtual; abstract;
+    procedure PlayFile(const mp3: TMP3File); virtual; abstract;
+    procedure Play(const mp3: TMP3File); virtual; abstract;
+    procedure Stop(); virtual; abstract;
+
+    property OnProgress: TPlayerOnProgress read FOnProgress write FOnProgress;
+  end;
+
+  TPlayerDirectShow = class(TPlayer)
+  private
     FDSInterface: IDirectSound;
     FDSBufferPrimary  : IDirectSoundBuffer;
     FDSBufferSecondary: IDirectSoundBuffer;
@@ -85,7 +99,6 @@ type  // Riff Wave File Header
     FWAVHeader        : TWaveFormatEx;
     FDataStream       : TMemoryStream;
     FTimerId          : Cardinal;
-    FOnProgress       : TPlayerOnProgress;
     FCaller           : procedure() of object;
     m_pHEvent: array[0..1] of THandle;
     procedure SetFormat(const wfe: PWaveFormatEx);
@@ -93,12 +106,46 @@ type  // Riff Wave File Header
     procedure TimerEventBuffer();
     procedure TimerEventStream();
   public
-    constructor Create();
+    constructor Create(); override;
     destructor Destroy(); override;
 
-    procedure PlayFile(const mp3: TMP3File);
-    procedure Play(const mp3: TMP3File);
-    procedure Stop();
+    procedure PlayFile(const mp3: TMP3File); override;
+    procedure Play(const mp3: TMP3File); override;
+    procedure Stop(); override;
+  end;
+
+  TOpenAlThread = class(TThread)
+  private
+    FBuffers  : array[0..1] of TALUInt;
+    FSource   : TALUInt;
+    FFormat   : TALEnum;
+    FRate     : Integer;
+    FMP3File  : TMP3File;
+
+    FWAVHeader   : TWaveFormatEx;
+    FPCMBuffer   : Pointer;
+    FPCMBufferLen: NativeInt;
+    procedure UpdateBuffer;
+    procedure PreBuffer;
+    procedure Stream(Buffer : TALUInt);
+  public
+    procedure Play;
+    procedure Stop;
+    procedure Execute; override;
+    constructor Create(const mp3: TMP3File);
+    destructor Destroy; override;
+  end;
+
+  TPlayerOpenAl = class(TPlayer)
+  private
+    FThread: TOpenAlThread;
+  public
+    constructor Create(); override;
+    destructor Destroy(); override;
+
+    procedure PlayFile(const mp3: TMP3File); override;
+    procedure Play(const mp3: TMP3File); override;
+    procedure Stop(); override;
   end;
 
   // Patch Panel for Accept Files
@@ -120,6 +167,7 @@ type  // Riff Wave File Header
     Label1: TLabel;
     Panel1: TPanel;
     SaveDialog1: TSaveDialog;
+    ComboBox1: TComboBox;
     procedure FormCreate(Sender: TObject);
     procedure FormDestroy(Sender: TObject);
     procedure Button1Click(Sender: TObject);
@@ -142,6 +190,14 @@ var
 
 implementation
 
+var
+  alSourcePos: array [0..2] of TALfloat= ( 0.0, 0.0, 0.0 );
+  alSourceVel: array [0..2] of TALfloat= ( 0.0, 0.0, 0.0 );
+  alListenerPos: array [0..2] of TALfloat= ( 0.0, 0.0, 0.0);
+  alListenerVel: array [0..2] of TALfloat= ( 0.0, 0.0, 0.0);
+  alListenerOri: array [0..5] of TALfloat= ( 0.0, 0.0, -1.0, 0.0, 1.0, 0.0);
+  alutArgv: array of PalByte;
+
 {$R *.dfm}
 
 function ToTime(const Value: Cardinal): String;
@@ -151,7 +207,7 @@ end;
 
 procedure TimerCallback(uTimerID, uMessage: UINT; dwUser, dw1, dw2: DWORD_PTR); stdcall;
 begin
-  TPlayer(dwUser).FCaller();
+  TPlayerDirectShow(dwUser).FCaller();
 end;
 
 { TMemoryStreamExtend }
@@ -222,8 +278,19 @@ begin
   DragAcceptFiles(Panel1.Handle, True);
   Panel1.OnDropFile := OnDropFile;
 
-  FPlayer := TPlayer.Create();
-  FPlayer.FOnProgress := Progress;
+  // InitOpenAL
+  IsMultiThread := True;
+
+  if InitOpenAL() then
+  begin
+    alutInit(nil, alutArgv);
+    AlListenerfv(AL_POSITION, @alListenerPos);
+    AlListenerfv(AL_VELOCITY, @alListenerVel);
+    AlListenerfv(AL_ORIENTATION, @alListenerOri);
+  end else ComboBox1.Enabled := False;
+
+  //FPlayer := TPlayerDirectShow.Create();
+  FPlayer := nil;
   FMP3File := nil;
 end;
 
@@ -247,6 +314,20 @@ begin
   // Load Collada File as biingModel
   if SameText(sFileExtension, '.mp3') then
   begin
+    if not Assigned(FPlayer) then
+    begin
+      ComboBox1.Enabled := False;
+
+      case ComboBox1.ItemIndex of
+        0: FPlayer := TPlayerDirectShow.Create();
+        1: FPlayer := TPlayerOpenAl.Create();
+      else
+        raise Exception.Create('Unknow Output Renderer');
+      end;
+
+      FPlayer.FOnProgress := Progress;
+    end;
+
     if Assigned(FMP3File) then
     begin
       FPlayer.Stop();
@@ -263,7 +344,7 @@ begin
     Report('Bitrate %d kbps', [FMP3File.FMP3Bitrate_kbps]);
 
     Button1.Enabled := True;
-    Button2.Enabled := True;
+    Button2.Enabled := (ComboBox1.ItemIndex = 0);
     Button3.Enabled := True;
 
     AcceptNextFile := False;
@@ -276,10 +357,10 @@ var
 begin
   if Pos > 0 then
   begin
-    sec := Pos / (Sender as TPlayer).FWAVHeader.nAvgBytesPerSec;
+    sec := Pos / (Sender as TPlayerDirectShow).FWAVHeader.nAvgBytesPerSec;
   end else sec := 0;
 
-  tot := Total / (Sender as TPlayer).FWAVHeader.nAvgBytesPerSec;
+  tot := Total / (Sender as TPlayerDirectShow).FWAVHeader.nAvgBytesPerSec;
 
   Label1.Caption := Format('%d of %d %s of %s', [Pos, Total, ToTime(Round(sec)), ToTime(Round(tot))]);
 end;
@@ -555,23 +636,23 @@ end;
 
 { TPlayFile }
 
-constructor TPlayer.Create;
+constructor TPlayerDirectShow.Create;
 begin
 	m_pHEvent[0] := CreateEvent(nil, FALSE, FALSE, PChar('Direct_Sound_Buffer_Notify_0'));
 	m_pHEvent[1] := CreateEvent(nil, FALSE, FALSE, PChar('Direct_Sound_Buffer_Notify_1'));
   FDataStream := TMemoryStream.Create();
   FTimerId := 0;
-  FOnProgress := nil;
+//  FOnProgress := nil;
 end;
 
-destructor TPlayer.Destroy;
+destructor TPlayerDirectShow.Destroy;
 begin
   Stop();
   FDataStream.Free();
   inherited;
 end;
 
-function TPlayer.FailedEx(hRes: HResult; Operation: String): Boolean;
+function TPlayerDirectShow.FailedEx(hRes: HResult; Operation: String): Boolean;
 begin
   case hRes of
     DS_OK: Exit(False);
@@ -586,7 +667,7 @@ begin
   end;
 end;
 
-procedure TPlayer.Play(const mp3: TMP3File);
+procedure TPlayerDirectShow.Play(const mp3: TMP3File);
 var
   ptrAudio1: Pointer;
   ptrAudio2: Pointer;
@@ -594,7 +675,7 @@ var
   dwBytesAudio2: Cardinal;
 begin
   if not mp3.GetFormat(@FWAVHeader) then
-    raise Exception.Create('Fehlermeldung');
+    raise Exception.Create('Ups');
 
   FDataStream.Clear();
   mp3.DecodeTo(FDataStream);
@@ -618,10 +699,10 @@ begin
     ZeroMemory(ptrAudio2, dwBytesAudio2);
 
   if (ptrAudio1 <> nil) and (dwBytesAudio1 > 0) then
-    FMP3File.DecodeTo(ptrAudio1, dwBytesAudio1);
+    FDataStream.Read(ptrAudio1^, dwBytesAudio1);
 
   if (ptrAudio2 <> nil) and (dwBytesAudio2 > 0) then
-    FMP3File.DecodeTo(ptrAudio2, dwBytesAudio2);
+    FDataStream.Read(ptrAudio2^, dwBytesAudio2);
 
   FDSBufferSecondary.Unlock(ptrAudio1, dwBytesAudio1, ptrAudio2, dwBytesAudio2);
 
@@ -633,7 +714,7 @@ begin
     OutputDebugString('***** TIMER FAILED *****');
 end;
 
-procedure TPlayer.PlayFile(const mp3: TMP3File);
+procedure TPlayerDirectShow.PlayFile(const mp3: TMP3File);
 var
   ptrAudio1: Pointer;
   ptrAudio2: Pointer;
@@ -641,7 +722,7 @@ var
   dwBytesAudio2: Cardinal;
 begin
   if not mp3.GetFormat(@FWAVHeader) then
-    raise Exception.Create('Fehlermeldung');
+    raise Exception.Create('Ups');
 
   FCaller := TimerEventStream;
   FMP3File := mp3;
@@ -677,7 +758,7 @@ begin
     OutputDebugString('***** TIMER FAILED *****');
 end;
 
-procedure TPlayer.SetFormat(const wfe: PWaveFormatEx);
+procedure TPlayerDirectShow.SetFormat(const wfe: PWaveFormatEx);
 var
   hWnd: THandle;
   bufDesc: DSBUFFERDESC;
@@ -716,7 +797,6 @@ begin
 	//Create Second Sound Buffer
 	bufDesc.dwFlags := DSBCAPS_CTRLPOSITIONNOTIFY or DSBCAPS_GLOBALFOCUS;
 	bufDesc.dwBufferBytes := 2 * wfe.nAvgBytesPerSec; //2 Seconds Buffer
-//  bufDesc.dwBufferBytes := dwBufferSize;
 	bufDesc.lpwfxFormat := wfe;
 
   if Failed(FDSInterface.CreateSoundBuffer(bufDesc, FDSBufferSecondary, nil)) then
@@ -745,7 +825,7 @@ begin
   end;
 end;
 
-procedure TPlayer.Stop;
+procedure TPlayerDirectShow.Stop;
 begin
   if (FDSBufferSecondary <> nil) then
   begin
@@ -760,7 +840,7 @@ begin
   end;
 end;
 
-procedure TPlayer.TimerEventBuffer;
+procedure TPlayerDirectShow.TimerEventBuffer;
 var
   ptrAudio1: Pointer;
   ptrAudio2: Pointer;
@@ -775,12 +855,10 @@ begin
 
   if hr = WAIT_OBJECT_0 then
   begin
-    OutputDebugString('***** BUFFER(1) *****');
     dwOffset := FWAVHeader.nAvgBytesPerSec;
     dwBytes := FWAVHeader.nAvgBytesPerSec;
   end else if hr = WAIT_OBJECT_0 + 1 then
            begin
-             OutputDebugString('***** BUFFER(2) *****');
              dwOffset := 0;
              dwBytes := FWAVHeader.nAvgBytesPerSec;
            end else begin
@@ -823,8 +901,7 @@ begin
 
   FDSBufferSecondary.Unlock(ptrAudio1, dwBytesAudio1, ptrAudio2, dwBytesAudio2);
 
-  if Assigned(FOnProgress) then
-    FOnProgress(Self, FDataStream.Position, FDataStream.Size);
+  DoProgress(FDataStream.Position, FDataStream.Size);
 
   if dwBytesAvailable <= 0 then
   begin
@@ -833,7 +910,7 @@ begin
   end;
 end;
 
-procedure TPlayer.TimerEventStream;
+procedure TPlayerDirectShow.TimerEventStream;
 var
   ptrAudio1: Pointer;
   ptrAudio2: Pointer;
@@ -898,14 +975,151 @@ begin
 
   FDSBufferSecondary.Unlock(ptrAudio1, dwBytesAudio1, ptrAudio2, dwBytesAudio2);
 
-  if Assigned(FOnProgress) then
-    FOnProgress(Self, FMP3File.FPCMTotalSize, 0);
+  DoProgress(FMP3File.FPCMTotalSize, 0);
 
   if FMP3File.FMP3Data.DataLen <= 0 then
   begin
     OutputDebugString('***** STOP *****');
     Stop();
   end;
+end;
+
+{ TOpenAlThread }
+
+constructor TOpenAlThread.Create(const mp3: TMP3File);
+begin
+  inherited Create(True);
+
+  Priority := tpTimeCritical;
+  FreeOnTerminate := True;
+
+  FFormat := AL_FORMAT_STEREO16; //TODO: this should be determined from mp3 file
+  FRate := mp3.FMP3Hz;
+  FMP3File := mp3;
+
+  alGenBuffers(2, @FBuffers);
+  alGenSources(1, @FSource);
+  alSource3f(FSource, AL_POSITION, 0, 0, 0);
+  alSource3f(FSource, AL_VELOCITY, 0, 0, 0);
+  alSource3f(FSource, AL_DIRECTION, 0, 0, 0);
+  alSourcef(FSource, AL_ROLLOFF_FACTOR, 0);
+  alSourcei(FSource, AL_SOURCE_RELATIVE, AL_TRUE);
+
+  FMP3File.GetFormat(@FWAVHeader);
+
+  FPCMBuffer    := nil;
+  FPCMBufferLen := FWAVHeader.nAvgBytesPerSec;
+
+  GetMem(FPCMBuffer, FPCMBufferLen);
+  ZeroMemory(FPCMBuffer, FPCMBufferLen);
+end;
+
+destructor TOpenAlThread.Destroy;
+begin
+  alSourceStop(FSource);
+  alDeleteSources(1, @FSource);
+  alDeleteBuffers(1, @FBuffers);
+  FreeMem(FPCMBuffer, FPCMBufferLen);
+  inherited;
+end;
+
+procedure TOpenAlThread.Execute;
+var
+  critical : RTL_CRITICAL_SECTION;
+begin
+  while not Terminated do
+  begin
+    InitializeCriticalSection(critical);
+    EnterCriticalSection(critical);
+    UpdateBuffer;
+    LeaveCriticalSection(critical);
+    DeleteCriticalSection(critical);
+    Sleep(50); //TODO: are there better ways to do this?
+  end;
+end;
+
+procedure TOpenAlThread.Play;
+begin
+  PreBuffer();
+  Resume();
+  alSourcePlay(FSource);
+end;
+
+procedure TOpenAlThread.PreBuffer;
+begin
+  Stream(FBuffers[0]);
+  Stream(FBuffers[1]);
+  alSourceQueueBuffers(FSource, 2, @FBuffers);
+end;
+
+procedure TOpenAlThread.Stop;
+begin
+  Suspend;
+  alSourceStop(FSource);
+end;
+
+procedure TOpenAlThread.Stream(Buffer: TALUInt);
+begin
+  FMP3File.DecodeTo(FPCMBuffer, FPCMBufferLen);
+  alBufferData(Buffer, FFormat, FPCMBuffer, FPCMBufferLen, FRate);
+end;
+
+procedure TOpenAlThread.UpdateBuffer;
+var
+ Processed : Integer;
+ Buffer    : TALUInt;
+begin
+  //TODO: detect end of mp3
+  alGetSourcei(FSource, AL_BUFFERS_PROCESSED, @Processed);
+  if Processed > 0 then
+    repeat
+      alSourceUnqueueBuffers(FSource, 1, @Buffer);
+      Stream(Buffer);
+      alSourceQueueBuffers(FSource, 1, @Buffer);
+      Dec(Processed);
+    until Processed <= 0;
+end;
+
+{ TPlayerOpenAl }
+
+constructor TPlayerOpenAl.Create;
+begin
+  FThread := nil;
+end;
+
+destructor TPlayerOpenAl.Destroy;
+begin
+  if Assigned(FThread) then
+  begin
+    FThread.Terminate();
+    FThread := nil;
+  end;
+  inherited;
+end;
+
+procedure TPlayerOpenAl.Play(const mp3: TMP3File);
+begin
+  FThread := TOpenAlThread.Create(mp3);
+  FThread.Play();
+end;
+
+procedure TPlayerOpenAl.PlayFile(const mp3: TMP3File);
+begin
+  FThread := TOpenAlThread.Create(mp3);
+  FThread.Play();
+end;
+
+procedure TPlayerOpenAl.Stop;
+begin
+
+end;
+
+{ TPlayer }
+
+procedure TPlayer.DoProgress(const Pos, Total: Int64);
+begin
+  if Assigned(FOnProgress) then
+    FOnProgress(Self, Pos, Total);
 end;
 
 end.

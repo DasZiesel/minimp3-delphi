@@ -1,7 +1,7 @@
 object Form1: TForm1
   Left = 0
   Top = 0
-  Caption = 'miniMP3 DirectShow Player'
+  Caption = 'miniMP3 DirectShow/OpenAl Player'
   ClientHeight = 299
   ClientWidth = 635
   Color = clBtnFace
@@ -74,6 +74,20 @@ object Form1: TForm1
     BevelOuter = bvNone
     Caption = 'Drop your MP3 File here...'
     TabOrder = 4
+  end
+  object ComboBox1: TComboBox
+    Left = 399
+    Top = 12
+    Width = 228
+    Height = 21
+    Style = csDropDownList
+    Anchors = [akTop, akRight]
+    ItemIndex = 0
+    TabOrder = 5
+    Text = 'DirectSound'
+    Items.Strings = (
+      'DirectSound'
+      'OpenAL')
   end
   object SaveDialog1: TSaveDialog
     DefaultExt = '*.wav'
